@@ -3,10 +3,74 @@
 use super::types::Language;
 use tree_sitter::Node;
 
+/// Iterate over all nodes in a subtree using an explicit stack (no recursion).
+fn walk_tree<'a, F>(root: Node<'a>, mut f: F)
+where
+    F: FnMut(Node<'a>),
+{
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        f(node);
+        for child in node.children(&mut node.walk()) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Non-recursive depth-limited search for the first node whose `kind()` matches
+/// `target_kind`.  Uses an explicit stack so it can never blow the call stack.
+fn find_first_by_kind<'a>(root: Node<'a>, target_kind: &str, max_depth: usize) -> Option<Node<'a>> {
+    // Explicit stack avoids call-stack overflow on deep ASTs.
+    // Children are pushed in reverse order so left-to-right DFS matches
+    // the behaviour of the recursive helpers this replaces.
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if node.kind() == target_kind {
+            return Some(node);
+        }
+        if depth < max_depth {
+            let children: Vec<_> = node.children(&mut node.walk()).collect();
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    None
+}
+
+/// Like [`find_first_by_kind`] but accepts multiple target kinds.
+fn find_first_by_kinds<'a>(
+    root: Node<'a>,
+    target_kinds: &[&str],
+    max_depth: usize,
+) -> Option<Node<'a>> {
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if target_kinds.contains(&node.kind()) {
+            return Some(node);
+        }
+        if depth < max_depth {
+            let children: Vec<_> = node.children(&mut node.walk()).collect();
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    None
+}
+
 /// Find the identifier inside a C/C++ declarator.
 /// Handles: identifier, pointer_declarator, array_declarator, function_declarator,
 /// parenthesized_declarator, reference_declarator (C++ references)
-fn find_identifier_in_declarator<'a>(node: Node<'a>, _bytes: &[u8]) -> Option<Node<'a>> {
+fn find_identifier_in_declarator<'a>(
+    node: Node<'a>,
+    _bytes: &[u8],
+    depth: usize,
+    max_depth: usize,
+) -> Option<Node<'a>> {
+    if depth > max_depth {
+        return None;
+    }
     match node.kind() {
         "identifier" => Some(node),
         "pointer_declarator"
@@ -16,11 +80,13 @@ fn find_identifier_in_declarator<'a>(node: Node<'a>, _bytes: &[u8]) -> Option<No
         | "reference_declarator" => {
             // The identifier is nested inside, try declarator field first
             if let Some(inner) = node.child_by_field_name("declarator") {
-                return find_identifier_in_declarator(inner, _bytes);
+                return find_identifier_in_declarator(inner, _bytes, depth + 1, max_depth);
             }
             // For function pointers like (*func), check children
             for child in node.children(&mut node.walk()) {
-                if let Some(found) = find_identifier_in_declarator(child, _bytes) {
+                if let Some(found) =
+                    find_identifier_in_declarator(child, _bytes, depth + 1, max_depth)
+                {
                     return Some(found);
                 }
             }
@@ -431,9 +497,9 @@ pub fn extract_parameters(node: Node, bytes: &[u8], lang: Language) -> Vec<Strin
                 } else if matches!(lang, Language::C | Language::Cpp) {
                     // For C/C++, parameter_declaration has a "declarator" field
                     // This can be: identifier, pointer_declarator, array_declarator, function_declarator
-                    child
-                        .child_by_field_name("declarator")
-                        .and_then(|d| find_identifier_in_declarator(d, bytes))
+                    child.child_by_field_name("declarator").and_then(|d| {
+                        find_identifier_in_declarator(d, bytes, 0, super::max_recursion_depth())
+                    })
                 } else if lang == Language::Kotlin {
                     // For Kotlin, the identifier is a direct child of the parameter node
                     child.child(0).filter(|c| c.kind() == "identifier")
@@ -441,7 +507,14 @@ pub fn extract_parameters(node: Node, bytes: &[u8], lang: Language) -> Vec<Strin
                     // For OCaml, parameter contains value_pattern or typed_pattern
                     // value_pattern contains the actual identifier
                     // Use named_child(0) to skip anonymous nodes like parentheses
-                    fn find_ocaml_param_name<'a>(node: Node<'a>) -> Option<Node<'a>> {
+                    fn find_ocaml_param_name<'a>(
+                        node: Node<'a>,
+                        depth: usize,
+                        max_depth: usize,
+                    ) -> Option<Node<'a>> {
+                        if depth > max_depth {
+                            return None;
+                        }
                         match node.kind() {
                             "value_pattern" | "value_name" => {
                                 // value_pattern text is the identifier
@@ -449,16 +522,18 @@ pub fn extract_parameters(node: Node, bytes: &[u8], lang: Language) -> Vec<Strin
                             }
                             "typed" | "typed_pattern" => {
                                 // typed/typed_pattern has value_pattern as first named child
-                                node.named_child(0).and_then(find_ocaml_param_name)
+                                node.named_child(0)
+                                    .and_then(|c| find_ocaml_param_name(c, depth + 1, max_depth))
                             }
                             "parameter" => {
                                 // parameter has value_pattern or typed_pattern as named child
-                                node.named_child(0).and_then(find_ocaml_param_name)
+                                node.named_child(0)
+                                    .and_then(|c| find_ocaml_param_name(c, depth + 1, max_depth))
                             }
                             _ => None,
                         }
                     }
-                    find_ocaml_param_name(child)
+                    find_ocaml_param_name(child, 0, super::max_recursion_depth())
                 } else {
                     None
                 }
@@ -533,13 +608,13 @@ pub fn extract_function_calls(node: Node, bytes: &[u8], lang: Language) -> Vec<S
         _ => return calls,
     };
 
-    fn visit(node: Node, bytes: &[u8], call_types: &[&str], calls: &mut Vec<String>) {
-        if call_types.contains(&node.kind()) {
-            if let Some(name_node) = node
+    walk_tree(node, |current| {
+        if call_types.contains(&current.kind()) {
+            if let Some(name_node) = current
                 .child_by_field_name("function")
-                .or_else(|| node.child_by_field_name("name"))
-                .or_else(|| node.child_by_field_name("method"))
-                .or_else(|| node.child(0))
+                .or_else(|| current.child_by_field_name("name"))
+                .or_else(|| current.child_by_field_name("method"))
+                .or_else(|| current.child(0))
             {
                 if let Ok(text) = name_node.utf8_text(bytes) {
                     #[allow(clippy::double_ended_iterator_last)]
@@ -559,12 +634,7 @@ pub fn extract_function_calls(node: Node, bytes: &[u8], lang: Language) -> Vec<S
                 }
             }
         }
-        for child in node.children(&mut node.walk()) {
-            visit(child, bytes, call_types, calls);
-        }
-    }
-
-    visit(node, bytes, call_types, &mut calls);
+    });
     calls.sort();
     calls.dedup();
     calls
@@ -577,14 +647,8 @@ pub fn extract_control_flow(node: Node, _lang: Language) -> (usize, bool, bool, 
     let mut has_branches = false;
     let mut has_error_handling = false;
 
-    fn visit(
-        node: Node,
-        complexity: &mut usize,
-        loops: &mut bool,
-        branches: &mut bool,
-        errors: &mut bool,
-    ) {
-        match node.kind() {
+    walk_tree(node, |current| {
+        match current.kind() {
             // Branches
             "if_statement"
             | "if_expression"
@@ -597,39 +661,28 @@ pub fn extract_control_flow(node: Node, _lang: Language) -> (usize, bool, bool, 
             | "if"
             | "unless"
             | "when" => {
-                *complexity += 1;
-                *branches = true;
+                complexity += 1;
+                has_branches = true;
             }
             // Loops
             "for_statement" | "for_expression" | "while_statement" | "while_expression"
             | "loop_expression" | "for_in_statement" | "foreach_statement" | "do_statement"
             | "for" | "while" | "until" => {
-                *complexity += 1;
-                *loops = true;
+                complexity += 1;
+                has_loops = true;
             }
             // Error handling
             "try_statement" | "try_expression" | "catch_clause" | "rescue" | "except_clause"
             | "try" => {
-                *errors = true;
+                has_error_handling = true;
             }
             // Rust-specific error handling patterns
             "?" | "try_operator" => {
-                *errors = true;
+                has_error_handling = true;
             }
             _ => {}
         }
-        for child in node.children(&mut node.walk()) {
-            visit(child, complexity, loops, branches, errors);
-        }
-    }
-
-    visit(
-        node,
-        &mut complexity,
-        &mut has_loops,
-        &mut has_branches,
-        &mut has_error_handling,
-    );
+    });
     (complexity, has_loops, has_branches, has_error_handling)
 }
 
@@ -658,27 +711,30 @@ pub fn extract_variables(node: Node, bytes: &[u8], lang: Language) -> Vec<String
         _ => return vars,
     };
 
-    fn visit(node: Node, bytes: &[u8], var_types: &[&str], vars: &mut Vec<String>, lang: Language) {
-        if var_types.contains(&node.kind()) {
+    walk_tree(node, |current| {
+        if var_types.contains(&current.kind()) {
             // For C/C++, get the declarator field which contains the variable name
             let name_node = if matches!(lang, Language::C | Language::Cpp) {
                 // For init_declarator: get declarator field
-                if node.kind() == "init_declarator" {
-                    node.child_by_field_name("declarator")
-                        .and_then(|d| find_identifier_in_declarator(d, bytes))
-                } else if node.kind() == "declaration" {
+                if current.kind() == "init_declarator" {
+                    current.child_by_field_name("declarator").and_then(|d| {
+                        find_identifier_in_declarator(d, bytes, 0, super::max_recursion_depth())
+                    })
+                } else if current.kind() == "declaration" {
                     // For declaration without init (e.g., `int x;` or `std::vector<int> result;`)
                     // Get the declarator field directly
-                    node.child_by_field_name("declarator")
-                        .and_then(|d| find_identifier_in_declarator(d, bytes))
+                    current.child_by_field_name("declarator").and_then(|d| {
+                        find_identifier_in_declarator(d, bytes, 0, super::max_recursion_depth())
+                    })
                 } else {
                     None
                 }
             } else {
-                node.child_by_field_name("left")
-                    .or_else(|| node.child_by_field_name("name"))
-                    .or_else(|| node.child_by_field_name("pattern"))
-                    .or_else(|| node.child(0))
+                current
+                    .child_by_field_name("left")
+                    .or_else(|| current.child_by_field_name("name"))
+                    .or_else(|| current.child_by_field_name("pattern"))
+                    .or_else(|| current.child(0))
             };
 
             if let Some(name_node) = name_node {
@@ -697,12 +753,7 @@ pub fn extract_variables(node: Node, bytes: &[u8], lang: Language) -> Vec<String
                 }
             }
         }
-        for child in node.children(&mut node.walk()) {
-            visit(child, bytes, var_types, vars, lang);
-        }
-    }
-
-    visit(node, bytes, var_types, &mut vars, lang);
+    });
     vars.sort();
     vars.dedup();
     vars
@@ -739,7 +790,12 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
         import_types: &[&str],
         imports: &mut Vec<String>,
         lang: Language,
+        depth: usize,
+        max_depth: usize,
     ) {
+        if depth > max_depth {
+            return;
+        }
         if import_types.contains(&node.kind()) {
             // For Ruby, check if it's actually a require call and extract the module name
             if lang == Language::Ruby {
@@ -780,7 +836,15 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
                             if text != "require" {
                                 // Not a require call, skip
                                 for child in node.children(&mut node.walk()) {
-                                    visit(child, bytes, import_types, imports, lang);
+                                    visit(
+                                        child,
+                                        bytes,
+                                        import_types,
+                                        imports,
+                                        lang,
+                                        depth + 1,
+                                        max_depth,
+                                    );
                                 }
                                 return;
                             }
@@ -789,20 +853,30 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
                 }
                 // Extract the string argument from require("json")
                 if let Some(args) = node.child_by_field_name("arguments") {
-                    fn find_string_content(node: Node, bytes: &[u8]) -> Option<String> {
+                    fn find_string_content(
+                        node: Node,
+                        bytes: &[u8],
+                        depth: usize,
+                        max_depth: usize,
+                    ) -> Option<String> {
+                        if depth > max_depth {
+                            return None;
+                        }
                         if node.kind() == "string_content" {
                             if let Ok(text) = node.utf8_text(bytes) {
                                 return Some(text.to_string());
                             }
                         }
                         for child in node.children(&mut node.walk()) {
-                            if let Some(content) = find_string_content(child, bytes) {
+                            if let Some(content) =
+                                find_string_content(child, bytes, depth + 1, max_depth)
+                            {
                                 return Some(content);
                             }
                         }
                         None
                     }
-                    if let Some(module) = find_string_content(args, bytes) {
+                    if let Some(module) = find_string_content(args, bytes, 0, max_depth) {
                         if !module.is_empty() {
                             imports.push(module);
                         }
@@ -815,7 +889,15 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
             if lang == Language::Go {
                 // Go import_spec contains interpreted_string_literal
                 // Extract the last path component as the package name
-                fn find_string_content(node: Node, bytes: &[u8]) -> Option<String> {
+                fn find_string_content(
+                    node: Node,
+                    bytes: &[u8],
+                    depth: usize,
+                    max_depth: usize,
+                ) -> Option<String> {
+                    if depth > max_depth {
+                        return None;
+                    }
                     if node.kind() == "interpreted_string_literal_content" {
                         if let Ok(text) = node.utf8_text(bytes) {
                             // Get the last path component (e.g., "fmt" from "fmt", "http" from "net/http")
@@ -823,13 +905,15 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
                         }
                     }
                     for child in node.children(&mut node.walk()) {
-                        if let Some(content) = find_string_content(child, bytes) {
+                        if let Some(content) =
+                            find_string_content(child, bytes, depth + 1, max_depth)
+                        {
                             return Some(content);
                         }
                     }
                     None
                 }
-                if let Some(pkg) = find_string_content(node, bytes) {
+                if let Some(pkg) = find_string_content(node, bytes, 0, max_depth) {
                     if !pkg.is_empty() {
                         imports.push(pkg);
                     }
@@ -839,20 +923,28 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
 
             // For OCaml, extract the module_name from open_module
             if lang == Language::Ocaml {
-                fn find_module_name(node: Node, bytes: &[u8]) -> Option<String> {
+                fn find_module_name(
+                    node: Node,
+                    bytes: &[u8],
+                    depth: usize,
+                    max_depth: usize,
+                ) -> Option<String> {
+                    if depth > max_depth {
+                        return None;
+                    }
                     if node.kind() == "module_name" {
                         if let Ok(text) = node.utf8_text(bytes) {
                             return Some(text.to_string());
                         }
                     }
                     for child in node.children(&mut node.walk()) {
-                        if let Some(name) = find_module_name(child, bytes) {
+                        if let Some(name) = find_module_name(child, bytes, depth + 1, max_depth) {
                             return Some(name);
                         }
                     }
                     None
                 }
-                if let Some(module) = find_module_name(node, bytes) {
+                if let Some(module) = find_module_name(node, bytes, 0, max_depth) {
                     if !module.is_empty() {
                         imports.push(module);
                     }
@@ -898,11 +990,20 @@ pub fn extract_file_imports(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
             }
         }
         for child in node.children(&mut node.walk()) {
-            visit(child, bytes, import_types, imports, lang);
+            visit(
+                child,
+                bytes,
+                import_types,
+                imports,
+                lang,
+                depth + 1,
+                max_depth,
+            );
         }
     }
 
-    visit(node, bytes, import_types, &mut imports, lang);
+    let max_depth = super::max_recursion_depth();
+    visit(node, bytes, import_types, &mut imports, lang, 0, max_depth);
     imports.sort();
     imports.dedup();
     imports
@@ -945,7 +1046,12 @@ pub fn extract_used_modules(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
         attr_types: &[&str],
         modules: &mut Vec<String>,
         lang: Language,
+        depth: usize,
+        max_depth: usize,
     ) {
+        if depth > max_depth {
+            return;
+        }
         if attr_types.contains(&node.kind()) {
             // Special handling for object_creation_expression (new ClassName())
             if node.kind() == "object_creation_expression" {
@@ -953,7 +1059,14 @@ pub fn extract_used_modules(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
                 // Java: generic_type -> type_identifier
                 // C#: generic_name -> identifier, or just identifier
                 // PHP: name (direct child)
-                fn find_type_identifier<'a>(n: Node<'a>) -> Option<Node<'a>> {
+                fn find_type_identifier<'a>(
+                    n: Node<'a>,
+                    depth: usize,
+                    max_depth: usize,
+                ) -> Option<Node<'a>> {
+                    if depth > max_depth {
+                        return None;
+                    }
                     // Java uses type_identifier, C# uses identifier, PHP uses name
                     if n.kind() == "type_identifier"
                         || n.kind() == "identifier"
@@ -962,13 +1075,13 @@ pub fn extract_used_modules(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
                         return Some(n);
                     }
                     for child in n.children(&mut n.walk()) {
-                        if let Some(found) = find_type_identifier(child) {
+                        if let Some(found) = find_type_identifier(child, depth + 1, max_depth) {
                             return Some(found);
                         }
                     }
                     None
                 }
-                if let Some(type_id) = find_type_identifier(node) {
+                if let Some(type_id) = find_type_identifier(node, 0, max_depth) {
                     if let Ok(text) = type_id.utf8_text(bytes) {
                         let name = text.trim();
                         if !name.is_empty() {
@@ -994,18 +1107,25 @@ pub fn extract_used_modules(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
                     Language::Ruby => node.child_by_field_name("receiver"),
                     Language::Ocaml => {
                         // OCaml value_path has module_path -> module_name
-                        fn find_module_name<'a>(n: Node<'a>) -> Option<Node<'a>> {
+                        fn find_module_name<'a>(
+                            n: Node<'a>,
+                            depth: usize,
+                            max_depth: usize,
+                        ) -> Option<Node<'a>> {
+                            if depth > max_depth {
+                                return None;
+                            }
                             if n.kind() == "module_name" {
                                 return Some(n);
                             }
                             for child in n.children(&mut n.walk()) {
-                                if let Some(found) = find_module_name(child) {
+                                if let Some(found) = find_module_name(child, depth + 1, max_depth) {
                                     return Some(found);
                                 }
                             }
                             None
                         }
-                        find_module_name(node)
+                        find_module_name(node, 0, max_depth)
                     }
                     _ => node.child(0),
                 };
@@ -1039,18 +1159,32 @@ pub fn extract_used_modules(node: Node, bytes: &[u8], lang: Language) -> Vec<Str
             }
         }
         for child in node.children(&mut node.walk()) {
-            visit(child, bytes, attr_types, modules, lang);
+            visit(
+                child,
+                bytes,
+                attr_types,
+                modules,
+                lang,
+                depth + 1,
+                max_depth,
+            );
         }
     }
 
-    visit(node, bytes, attr_types, &mut modules, lang);
+    let max_depth = super::max_recursion_depth();
+    visit(node, bytes, attr_types, &mut modules, lang, 0, max_depth);
     modules.sort();
     modules.dedup();
     modules
 }
 
 /// Extract parent class name from a class/struct definition.
-pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<String> {
+pub fn extract_parent_class(
+    node: Node,
+    bytes: &[u8],
+    lang: Language,
+    max_depth: usize,
+) -> Option<String> {
     match lang {
         // Python: class Dog(Animal): -> superclasses -> argument_list -> identifier
         Language::Python => {
@@ -1080,18 +1214,9 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
                     // Then try extends_clause (TypeScript)
                     for heritage_child in child.children(&mut child.walk()) {
                         if heritage_child.kind() == "extends_clause" {
-                            fn find_identifier<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                                if n.kind() == "identifier" {
-                                    return Some(n);
-                                }
-                                for child in n.children(&mut n.walk()) {
-                                    if let Some(found) = find_identifier(child) {
-                                        return Some(found);
-                                    }
-                                }
-                                None
-                            }
-                            if let Some(id) = find_identifier(heritage_child) {
+                            if let Some(id) =
+                                find_first_by_kind(heritage_child, "identifier", max_depth)
+                            {
                                 return id.utf8_text(bytes).ok().map(|s| s.to_string());
                             }
                         }
@@ -1104,38 +1229,15 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
         // Java: class Dog extends Animal -> superclass -> type_identifier
         Language::Java => {
             let superclass = node.child_by_field_name("superclass")?;
-            // Find type_identifier in superclass
-            fn find_type_id<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                if n.kind() == "type_identifier" {
-                    return Some(n);
-                }
-                for child in n.children(&mut n.walk()) {
-                    if let Some(found) = find_type_id(child) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            find_type_id(superclass).and_then(|n| n.utf8_text(bytes).ok().map(|s| s.to_string()))
+            find_first_by_kind(superclass, "type_identifier", max_depth)
+                .and_then(|n| n.utf8_text(bytes).ok().map(|s| s.to_string()))
         }
 
         // C#: class Dog : Animal -> base_list -> identifier
         Language::CSharp => {
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "base_list" {
-                    // Find first identifier in base list
-                    fn find_id<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                        if n.kind() == "identifier" {
-                            return Some(n);
-                        }
-                        for child in n.children(&mut n.walk()) {
-                            if let Some(found) = find_id(child) {
-                                return Some(found);
-                            }
-                        }
-                        None
-                    }
-                    if let Some(id) = find_id(child) {
+                    if let Some(id) = find_first_by_kind(child, "identifier", max_depth) {
                         return id.utf8_text(bytes).ok().map(|s| s.to_string());
                     }
                 }
@@ -1147,19 +1249,9 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
         Language::Kotlin => {
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "delegation_specifiers" {
-                    // Find first identifier (may be simple_identifier or identifier depending on tree-sitter version)
-                    fn find_id<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                        if n.kind() == "simple_identifier" || n.kind() == "identifier" {
-                            return Some(n);
-                        }
-                        for child in n.children(&mut n.walk()) {
-                            if let Some(found) = find_id(child) {
-                                return Some(found);
-                            }
-                        }
-                        None
-                    }
-                    if let Some(id) = find_id(child) {
+                    if let Some(id) =
+                        find_first_by_kinds(child, &["simple_identifier", "identifier"], max_depth)
+                    {
                         return id.utf8_text(bytes).ok().map(|s| s.to_string());
                     }
                 }
@@ -1170,41 +1262,17 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
         // Ruby: class Dog < Animal -> superclass -> superclass node -> constant
         Language::Ruby => {
             let superclass = node.child_by_field_name("superclass")?;
-            // Find constant within the superclass node (handles both direct and nested cases)
-            fn find_constant<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                if n.kind() == "constant" {
-                    return Some(n);
-                }
-                for child in n.children(&mut n.walk()) {
-                    if let Some(found) = find_constant(child) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            find_constant(superclass).and_then(|n| n.utf8_text(bytes).ok().map(|s| s.to_string()))
+            find_first_by_kind(superclass, "constant", max_depth)
+                .and_then(|n| n.utf8_text(bytes).ok().map(|s| s.to_string()))
         }
 
         // Swift: class Dog: Animal -> inheritance_specifier -> user_type -> type_identifier
         Language::Swift => {
             for child in node.children(&mut node.walk()) {
-                // Try both type_inheritance_clause and inheritance_specifier
                 if child.kind() == "type_inheritance_clause"
                     || child.kind() == "inheritance_specifier"
                 {
-                    // Find first type_identifier
-                    fn find_id<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                        if n.kind() == "type_identifier" {
-                            return Some(n);
-                        }
-                        for child in n.children(&mut n.walk()) {
-                            if let Some(found) = find_id(child) {
-                                return Some(found);
-                            }
-                        }
-                        None
-                    }
-                    if let Some(id) = find_id(child) {
+                    if let Some(id) = find_first_by_kind(child, "type_identifier", max_depth) {
                         return id.utf8_text(bytes).ok().map(|s| s.to_string());
                     }
                 }
@@ -1216,19 +1284,9 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
         Language::Php => {
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "base_clause" {
-                    // Find name or qualified_name
-                    fn find_name<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                        if n.kind() == "name" || n.kind() == "qualified_name" {
-                            return Some(n);
-                        }
-                        for child in n.children(&mut n.walk()) {
-                            if let Some(found) = find_name(child) {
-                                return Some(found);
-                            }
-                        }
-                        None
-                    }
-                    if let Some(id) = find_name(child) {
+                    if let Some(id) =
+                        find_first_by_kinds(child, &["name", "qualified_name"], max_depth)
+                    {
                         return id.utf8_text(bytes).ok().map(|s| s.to_string());
                     }
                 }
@@ -1240,19 +1298,7 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
         Language::Cpp => {
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "base_class_clause" {
-                    // Find type_identifier
-                    fn find_id<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                        if n.kind() == "type_identifier" {
-                            return Some(n);
-                        }
-                        for child in n.children(&mut n.walk()) {
-                            if let Some(found) = find_id(child) {
-                                return Some(found);
-                            }
-                        }
-                        None
-                    }
-                    if let Some(id) = find_id(child) {
+                    if let Some(id) = find_first_by_kind(child, "type_identifier", max_depth) {
                         return id.utf8_text(bytes).ok().map(|s| s.to_string());
                     }
                 }
@@ -1264,19 +1310,7 @@ pub fn extract_parent_class(node: Node, bytes: &[u8], lang: Language) -> Option<
         Language::Scala => {
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "extends_clause" {
-                    // Find type_identifier
-                    fn find_id<'a>(n: Node<'a>) -> Option<Node<'a>> {
-                        if n.kind() == "type_identifier" {
-                            return Some(n);
-                        }
-                        for child in n.children(&mut n.walk()) {
-                            if let Some(found) = find_id(child) {
-                                return Some(found);
-                            }
-                        }
-                        None
-                    }
-                    if let Some(id) = find_id(child) {
+                    if let Some(id) = find_first_by_kind(child, "type_identifier", max_depth) {
                         return id.utf8_text(bytes).ok().map(|s| s.to_string());
                     }
                 }
