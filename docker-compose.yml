@@ -1,92 +1,21 @@
-# =============================================================================
-# Next-Plaid API Docker Compose
-# =============================================================================
-# Default configuration with model support (CPU encoding).
-# Use docker-compose.cuda.yml overlay for GPU encoding.
-#
-# Vector Database Storage:
-#   Indices are persisted at ${NEXT_PLAID_DATA:-~/.local/share/next-plaid}
-#   Each index is stored as a subdirectory: <data-dir>/<index-name>/
-#   On container restart, existing indices are automatically loaded.
-#
-# Model Cache:
-#   Downloaded HuggingFace models are cached at ${NEXT_PLAID_MODELS:-~/.cache/huggingface/next-plaid}
-#   Models are only downloaded once and reused on subsequent container starts.
-#
-# Model Configuration (via command arguments):
-#   --model <id>           HuggingFace model ID or local path
-#   --int8                 Use INT8 quantized model (~2x faster on CPU)
-#   --parallel <N>         Number of parallel ONNX sessions
-#   --batch-size <N>       Batch size per session
-#   --threads <N>          Threads per session
-#   --query-length <N>     Max query length in tokens (default: 48)
-#   --document-length <N>  Max document length in tokens (default: 300)
-#   --cuda                 Use CUDA (for GPU builds)
-#
-# Rate Limiting & Concurrency (via environment variables):
-#   RATE_LIMIT_ENABLED          Enable rate limiting (default: false)
-#   RATE_LIMIT_PER_SECOND       Max requests per second (default: 50, when enabled)
-#   RATE_LIMIT_BURST_SIZE       Burst size for rate limiting (default: 100, when enabled)
-#   CONCURRENCY_LIMIT           Max concurrent in-flight requests (default: 100)
-#   MAX_QUEUED_TASKS_PER_INDEX  Max queued updates/deletes per index (default: 10)
-#   MAX_BATCH_DOCUMENTS         Max documents to batch before processing (default: 300)
-#   BATCH_CHANNEL_SIZE          Buffer size for document batch queue (default: 100)
-#   MAX_BATCH_TEXTS             Max texts to batch for encoding (default: 64)
-#   ENCODE_BATCH_CHANNEL_SIZE   Buffer size for encode batch queue (default: 256)
-#   MODEL_POOL_SIZE             Number of model workers for concurrent encoding (default: 1)
-#
-# CPU Defaults (optimized for throughput):
-#   --model lightonai/mxbai-edge-colbert-v0-32m-onnx --parallel 16 --batch-size 4
-#   For higher throughput with more memory: --parallel 32 --batch-size 2
-#
-# Examples:
-#   # Default configuration
-#   docker compose up -d
-#
-#   # Custom model with different parallel config (override command in docker-compose.override.yml)
-#   # Or run directly:
-#   docker run -p 8080:8080 -v ~/.local/share/next-plaid:/data/indices -v ~/.cache/huggingface/next-plaid:/models \
-#     next-plaid-api --model my-org/my-model --parallel 16 --batch-size 2
-#
-# To customize storage locations, create a .env file with:
-#   NEXT_PLAID_DATA=/path/to/indices
-#   NEXT_PLAID_MODELS=/path/to/models
-# =============================================================================
-
 services:
   next-plaid-api:
     build:
       context: .
       dockerfile: next-plaid-api/Dockerfile
-      target: runtime-cpu
     ports:
       - "8080:8080"
     volumes:
-      # Persistent vector database storage
-      # Default: ~/.local/share/next-plaid (XDG standard for user data)
-      # Override with NEXT_PLAID_DATA environment variable
       - ${NEXT_PLAID_DATA:-~/.local/share/next-plaid}:/data/indices
-      # Persistent model cache (auto-downloaded from HuggingFace)
-      # Default: ~/.cache/huggingface (standard HF cache location)
-      # Override with NEXT_PLAID_MODELS environment variable
-      - ${NEXT_PLAID_MODELS:-~/.cache/huggingface/next-plaid}:/models
     environment:
       - RUST_LOG=info
-      # Rate limiting (disabled by default, uncomment to enable)
       # - RATE_LIMIT_ENABLED=true
       # - RATE_LIMIT_PER_SECOND=${RATE_LIMIT_PER_SECOND:-50}
       # - RATE_LIMIT_BURST_SIZE=${RATE_LIMIT_BURST_SIZE:-100}
       - CONCURRENCY_LIMIT=${CONCURRENCY_LIMIT:-100}
-      # Document processing configuration
       - MAX_QUEUED_TASKS_PER_INDEX=${MAX_QUEUED_TASKS_PER_INDEX:-10}
       - MAX_BATCH_DOCUMENTS=${MAX_BATCH_DOCUMENTS:-300}
       - BATCH_CHANNEL_SIZE=${BATCH_CHANNEL_SIZE:-100}
-      # Encode batching configuration
-      - MAX_BATCH_TEXTS=${MAX_BATCH_TEXTS:-64}
-      - ENCODE_BATCH_CHANNEL_SIZE=${ENCODE_BATCH_CHANNEL_SIZE:-256}
-    # CPU defaults: 16 parallel sessions, batch size 4 (optimized for throughput)
-    # Benchmarked on SciFact: ~11-12 docs/s indexing throughput (2x faster than parallel=4, batch-size=32)
-    # More aggressive: use --parallel 32 --batch-size 2 for ~13 docs/s but higher memory
     command:
       - --host
       - "0.0.0.0"
@@ -94,30 +23,16 @@ services:
       - "8080"
       - --index-dir
       - /data/indices
-      - --model
-      - ${MODEL:-lightonai/answerai-colbert-small-v1-onnx}
-      - --int8  # Reduce precision for faster CPU inference, optional, you can remove this flag to use full precision
-      - --parallel
-      - "16"
-      - --batch-size
-      - "4"
-      - --model-pool-size
-      - "${MODEL_POOL_SIZE:-1}"
-      - --query-length
-      - "48"
-      - --document-length
-      - "300"
     healthcheck:
       test: ["CMD", "curl", "-f", "--max-time", "5", "http://localhost:8080/health"]
       interval: 15s
       timeout: 5s
       retries: 2
-      start_period: 120s  # Longer start period for model download + loading
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 16G
         reservations:
-          memory: 4G
-
+          memory: 1G

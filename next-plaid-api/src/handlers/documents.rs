@@ -20,12 +20,11 @@ use tokio::time::Instant;
 use next_plaid::{filtering, IndexConfig, Metadata, MmapIndex, UpdateConfig};
 
 use crate::error::{ApiError, ApiResult};
-use crate::handlers::encode::encode_texts_internal;
+
 use crate::models::{
     AddDocumentsRequest, CreateIndexRequest, CreateIndexResponse, DeleteDocumentsRequest,
-    DeleteIndexResponse, DocumentEmbeddings, ErrorResponse, IndexConfigStored, IndexInfoResponse,
-    InputType, UpdateIndexConfigRequest, UpdateIndexConfigResponse, UpdateIndexRequest,
-    UpdateWithEncodingRequest,
+    DeleteIndexResponse, DocumentEmbeddings, ErrorResponse, IndexConfigStored, IndexInfoResponse, 
+    UpdateIndexConfigRequest, UpdateIndexConfigResponse, UpdateIndexRequest,
 };
 use crate::state::AppState;
 use crate::tracing_middleware::TraceId;
@@ -1536,103 +1535,3 @@ pub async fn update_index_config(
     }))
 }
 
-/// Update an index with document texts (requires model to be loaded).
-///
-/// This endpoint encodes the document texts using the loaded model and then
-/// adds them to the index. Requires the server to be started with `--model <path>`.
-///
-/// Returns 202 Accepted immediately and processes in background.
-#[utoipa::path(
-    post,
-    path = "/indices/{name}/update_with_encoding",
-    tag = "indices",
-    params(
-        ("name" = String, Path, description = "Index name")
-    ),
-    request_body = UpdateWithEncodingRequest,
-    responses(
-        (status = 202, description = "Request accepted for background processing", body = String),
-        (status = 400, description = "Invalid request or model not loaded", body = ErrorResponse),
-        (status = 404, description = "Index not declared", body = ErrorResponse)
-    )
-)]
-pub async fn update_index_with_encoding(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-    Json(req): Json<UpdateWithEncodingRequest>,
-) -> ApiResult<impl IntoResponse> {
-    // Validate name
-    if name.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Index name cannot be empty".to_string(),
-        ));
-    }
-
-    // Check index is declared
-    let index_path = state.index_path(&name);
-    let config_path = index_path.join("config.json");
-    if !config_path.exists() {
-        return Err(ApiError::IndexNotDeclared(name));
-    }
-
-    // Validate input
-    if req.documents.is_empty() {
-        return Err(ApiError::BadRequest(
-            "At least one document is required".to_string(),
-        ));
-    }
-
-    // Validate metadata length
-    if req.metadata.len() != req.documents.len() {
-        return Err(ApiError::BadRequest(format!(
-            "Metadata length ({}) must match documents length ({})",
-            req.metadata.len(),
-            req.documents.len()
-        )));
-    }
-
-    // Get or create the batch queue for this index FIRST
-    let sender = get_or_create_batch_queue(&name, state.clone());
-
-    // Reserve a slot in the batch queue BEFORE encoding
-    // This ensures we don't waste encoding work if the queue is full
-    let permit = sender.try_reserve().map_err(|e| match e {
-        mpsc::error::TrySendError::Full(_) => ApiError::ServiceUnavailable(format!(
-            "Update queue full for index '{}'. Max {} pending items. Retry later.",
-            name,
-            batch_channel_size()
-        )),
-        mpsc::error::TrySendError::Closed(_) => {
-            ApiError::Internal(format!("Batch worker for index '{}' is not running", name))
-        }
-    })?;
-
-    // Now encode - we have a guaranteed slot in the batch queue
-    let embeddings = encode_texts_internal(
-        state.clone(),
-        &req.documents,
-        InputType::Document,
-        req.pool_factor,
-    )
-    .await?;
-
-    let doc_count = embeddings.len();
-
-    // Create batch item
-    let batch_item = BatchItem {
-        embeddings,
-        metadata: req.metadata,
-    };
-
-    // Send using the reserved permit - this is guaranteed to succeed
-    permit.send(batch_item);
-
-    tracing::debug!(
-        index = %name,
-        num_documents = doc_count,
-        "update.with_encoding.queued"
-    );
-
-    // Immediate Response
-    Ok((StatusCode::ACCEPTED, Json("Update queued for batching")))
-}

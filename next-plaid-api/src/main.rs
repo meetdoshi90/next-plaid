@@ -9,9 +9,11 @@
 //! - `POST /indices` - Create a new index
 //! - `GET /indices/{name}` - Get index info
 //! - `DELETE /indices/{name}` - Delete an index
+//! - `PUT /indices/{name}/config` - Update index config
 //!
 //! ## Documents
-//! - `POST /indices/{name}/documents` - Add documents
+//! - `POST /indices/{name}/update` - Add documents with pre-computed embeddings
+//! - `POST /indices/{name}/documents` - Add documents (legacy)
 //! - `DELETE /indices/{name}/documents` - Delete documents
 //!
 //! ## Search
@@ -20,7 +22,6 @@
 //!
 //! ## Metadata
 //! - `GET /indices/{name}/metadata` - Get all metadata
-//! - `POST /indices/{name}/metadata` - Add metadata
 //! - `GET /indices/{name}/metadata/count` - Get metadata count
 //! - `POST /indices/{name}/metadata/check` - Check if documents have metadata
 //! - `POST /indices/{name}/metadata/query` - Query metadata with SQL condition
@@ -64,7 +65,6 @@ use models::HealthResponse;
 use next_plaid_api::PrettyJson;
 use state::{ApiConfig, AppState};
 
-// OpenAPI documentation
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -82,8 +82,6 @@ use state::{ApiConfig, AppState};
         (name = "documents", description = "Document upload and deletion"),
         (name = "search", description = "Search operations"),
         (name = "metadata", description = "Metadata management and filtering"),
-        (name = "encoding", description = "Text encoding operations (requires --model)"),
-        (name = "reranking", description = "Document reranking with ColBERT MaxSim scoring")
     ),
     paths(
         health,
@@ -95,14 +93,8 @@ use state::{ApiConfig, AppState};
         handlers::documents::delete_documents,
         handlers::documents::update_index,
         handlers::documents::update_index_config,
-        handlers::documents::update_index_with_encoding,
         handlers::search::search,
         handlers::search::search_filtered,
-        handlers::search::search_with_encoding,
-        handlers::search::search_filtered_with_encoding,
-        handlers::encode::encode,
-        handlers::rerank::rerank,
-        handlers::rerank::rerank_with_encoding,
         handlers::metadata::get_all_metadata,
         handlers::metadata::get_metadata_count,
         handlers::metadata::check_metadata,
@@ -112,7 +104,6 @@ use state::{ApiConfig, AppState};
     ),
     components(schemas(
         models::HealthResponse,
-        models::ModelHealthInfo,
         models::IndexSummary,
         models::ErrorResponse,
         models::CreateIndexRequest,
@@ -145,47 +136,27 @@ use state::{ApiConfig, AppState};
         models::UpdateMetadataResponse,
         models::UpdateIndexConfigRequest,
         models::UpdateIndexConfigResponse,
-        models::InputType,
-        models::EncodeRequest,
-        models::EncodeResponse,
-        models::SearchWithEncodingRequest,
-        models::FilteredSearchWithEncodingRequest,
-        models::UpdateWithEncodingRequest,
-        models::RerankRequest,
-        models::RerankWithEncodingRequest,
-        models::RerankResult,
-        models::RerankResponse,
     ))
 )]
 struct ApiDoc;
 
-/// Cached sysinfo System for memory usage queries.
-/// Reusing the System object is much faster than creating a new one each time.
 static SYSINFO_SYSTEM: std::sync::OnceLock<std::sync::Mutex<sysinfo::System>> =
     std::sync::OnceLock::new();
 
-/// Get current process memory usage using cached System object.
 fn get_memory_usage_bytes() -> u64 {
     let pid = match sysinfo::get_current_pid() {
         Ok(pid) => pid,
         Err(_) => return 0,
     };
-
     let system_mutex = SYSINFO_SYSTEM.get_or_init(|| std::sync::Mutex::new(sysinfo::System::new()));
-
     let mut system = match system_mutex.lock() {
         Ok(guard) => guard,
-        Err(_) => return 0, // Mutex poisoned
+        Err(_) => return 0,
     };
-
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).map(|p| p.memory()).unwrap_or(0)
 }
 
-/// Health check and root endpoint.
-///
-/// Returns service status, version, index directory path, and a list of all available
-/// indices with their configuration (nbits, num_documents, dimension, etc.).
 #[utoipa::path(
     get,
     path = "/health",
@@ -195,52 +166,21 @@ fn get_memory_usage_bytes() -> u64 {
     )
 )]
 async fn health(state: axum::extract::State<Arc<AppState>>) -> PrettyJson<HealthResponse> {
-    // Ensure index directory exists (async-safe: only check, don't block on create)
     if !state.config.index_dir.exists() {
-        // Spawn blocking task for directory creation to avoid blocking async runtime
         let dir = state.config.index_dir.clone();
         tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir).ok());
     }
-
-    // Get current process memory usage using cached System
-    let memory_usage_bytes = get_memory_usage_bytes();
-
-    // Get model info from cached data (no lock required)
-    #[cfg(feature = "model")]
-    let model_info = state
-        .cached_model_info()
-        .map(|info| models::ModelHealthInfo {
-            name: info.name.clone(),
-            path: info.path.clone(),
-            quantized: info.quantized,
-            embedding_dim: info.embedding_dim,
-            batch_size: info.batch_size,
-            num_sessions: info.num_sessions,
-            query_prefix: info.query_prefix.clone(),
-            document_prefix: info.document_prefix.clone(),
-            query_length: info.query_length,
-            document_length: info.document_length,
-            do_query_expansion: info.do_query_expansion,
-            uses_token_type_ids: info.uses_token_type_ids,
-            mask_token_id: info.mask_token_id,
-            pad_token_id: info.pad_token_id,
-        });
-
-    #[cfg(not(feature = "model"))]
-    let model_info: Option<models::ModelHealthInfo> = None;
 
     PrettyJson(HealthResponse {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         loaded_indices: state.loaded_count(),
         index_dir: state.config.index_dir.to_string_lossy().to_string(),
-        memory_usage_bytes,
+        memory_usage_bytes: get_memory_usage_bytes(),
         indices: state.get_all_index_summaries(),
-        model: model_info,
     })
 }
 
-/// Handle rate limit errors with a JSON response.
 fn rate_limit_error(_err: tower_governor::GovernorError) -> axum::http::Response<axum::body::Body> {
     let body = serde_json::json!({
         "code": "RATE_LIMITED",
@@ -255,8 +195,6 @@ fn rate_limit_error(_err: tower_governor::GovernorError) -> axum::http::Response
         .unwrap()
 }
 
-/// Graceful shutdown signal handler.
-/// Listens for SIGINT (Ctrl+C) and SIGTERM (container stop).
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -276,18 +214,12 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
-            tracing::info!(signal = "SIGINT", "server.shutdown.initiated");
-        },
-        _ = terminate => {
-            tracing::info!(signal = "SIGTERM", "server.shutdown.initiated");
-        },
+        _ = ctrl_c => tracing::info!(signal = "SIGINT", "server.shutdown.initiated"),
+        _ = terminate => tracing::info!(signal = "SIGTERM", "server.shutdown.initiated"),
     }
 }
 
-/// Build the API router.
 fn build_router(state: Arc<AppState>) -> Router {
-    // Read rate limit configuration from environment variables
     let rate_limit_enabled: bool = std::env::var("RATE_LIMIT_ENABLED")
         .ok()
         .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
@@ -305,18 +237,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
 
-    if rate_limit_enabled {
-        tracing::info!(
-            rate_limit_per_second,
-            rate_limit_burst_size,
-            "rate_limiting.enabled"
-        );
-    } else {
-        tracing::info!("rate_limiting.disabled");
-    }
-
-    // Health endpoint - exempt from rate limiting to ensure monitoring always works
-    // Uses cached model info so it never blocks on model operations
+    // Health — exempt from rate limiting
     let health_router = Router::new()
         .route("/health", get(health))
         .route("/", get(health))
@@ -324,11 +245,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30), // Short timeout for health checks
+            Duration::from_secs(30),
         ))
         .with_state(state.clone());
 
-    // Index info/list endpoints - exempt from rate limiting for polling during async operations
+    // Index GET routes — exempt (clients poll these during async ops)
     let index_info_router = Router::new()
         .without_v07_checks()
         .route("/indices", get(handlers::list_indices))
@@ -339,317 +260,125 @@ fn build_router(state: Arc<AppState>) -> Router {
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state.clone());
 
-    // Update endpoint - exempt from rate limiting (has per-index semaphore protection)
+    // Update routes — exempt (per-index semaphore already provides backpressure)
     let update_router = Router::new()
         .without_v07_checks()
         .route("/indices/{name}/update", post(handlers::update_index))
-        .route(
-            "/indices/{name}/update_with_encoding",
-            post(handlers::update_index_with_encoding),
-        )
         .layer(middleware::from_fn(tracing_middleware::trace_request))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(300),
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(ConcurrencyLimitLayer::new(concurrency_limit))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .with_state(state.clone());
 
-    // Encode endpoint - exempt from rate limiting (has internal batching with backpressure)
-    let encode_router = Router::new()
-        .route("/encode", post(handlers::encode))
-        .route("/rerank", post(handlers::rerank))
-        .route(
-            "/rerank_with_encoding",
-            post(handlers::rerank_with_encoding),
-        )
-        .layer(middleware::from_fn(tracing_middleware::trace_request))
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(300),
-        ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .layer(ConcurrencyLimitLayer::new(concurrency_limit))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
-        .with_state(state.clone());
-
-    // Delete endpoint - exempt from rate limiting (has internal batching)
+    // Delete routes — exempt (has internal batching)
     let delete_router = Router::new()
         .without_v07_checks()
         .route("/indices/{name}", delete(handlers::delete_index))
-        .route(
-            "/indices/{name}/documents",
-            delete(handlers::delete_documents),
-        )
+        .route("/indices/{name}/documents", delete(handlers::delete_documents))
         .layer(middleware::from_fn(tracing_middleware::trace_request))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(300),
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(ConcurrencyLimitLayer::new(concurrency_limit))
         .with_state(state.clone());
 
-    // API router with rate limiting - use without_v07_checks to allow :param syntax
+    // Everything else — subject to rate limiting
     let api_router = Router::new()
         .without_v07_checks()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        // Index routes (GET routes are in index_info_router, exempt from rate limiting)
-        // Delete routes are in delete_router, exempt from rate limiting
         .route("/indices", post(handlers::create_index))
         .route("/indices/{name}/documents", post(handlers::add_documents))
         .route("/indices/{name}/config", put(handlers::update_index_config))
         .route("/indices/{name}/search", post(handlers::search))
-        .route(
-            "/indices/{name}/search/filtered",
-            post(handlers::search_filtered),
-        )
-        .route(
-            "/indices/{name}/search_with_encoding",
-            post(handlers::search_with_encoding),
-        )
-        .route(
-            "/indices/{name}/search/filtered_with_encoding",
-            post(handlers::search_filtered_with_encoding),
-        )
+        .route("/indices/{name}/search/filtered", post(handlers::search_filtered))
         .route("/indices/{name}/metadata", get(handlers::get_all_metadata))
-        .route(
-            "/indices/{name}/metadata/count",
-            get(handlers::get_metadata_count),
-        )
-        .route(
-            "/indices/{name}/metadata/check",
-            post(handlers::check_metadata),
-        )
-        .route(
-            "/indices/{name}/metadata/query",
-            post(handlers::query_metadata),
-        )
+        .route("/indices/{name}/metadata/count", get(handlers::get_metadata_count))
+        .route("/indices/{name}/metadata/check", post(handlers::check_metadata))
+        .route("/indices/{name}/metadata/query", post(handlers::query_metadata))
         .route("/indices/{name}/metadata/get", post(handlers::get_metadata))
-        .route(
-            "/indices/{name}/metadata/update",
-            post(handlers::update_metadata),
-        )
+        .route("/indices/{name}/metadata/update", post(handlers::update_metadata))
         .layer(middleware::from_fn(tracing_middleware::trace_request))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(300),
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        );
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any));
 
-    // Conditionally apply rate limiting (enabled via RATE_LIMIT_ENABLED=true)
     let api_router = if rate_limit_enabled {
         let governor_conf = GovernorConfigBuilder::default()
             .per_second(rate_limit_per_second)
             .burst_size(rate_limit_burst_size)
             .finish()
             .expect("Failed to build rate limiter config");
-        let governor_layer = GovernorLayer::new(governor_conf).error_handler(rate_limit_error);
-        api_router.layer(governor_layer)
+        api_router.layer(GovernorLayer::new(governor_conf).error_handler(rate_limit_error))
     } else {
         api_router
     };
 
     let api_router = api_router
-        // Global concurrency limit (configurable via CONCURRENCY_LIMIT)
         .layer(ConcurrencyLimitLayer::new(concurrency_limit))
-        // Allow large payloads for embedding uploads (100 MB)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .with_state(state);
 
-    // Merge routers: health first (takes precedence), then index info (no rate limit),
-    // then update/encode/delete (no rate limit), then API (with rate limit)
     Router::new()
         .merge(health_router)
         .merge(index_info_router)
         .merge(update_router)
-        .merge(encode_router)
         .merge(delete_router)
         .merge(api_router)
 }
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "next-plaid_api=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "next_plaid_api=info,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
     let mut host = "0.0.0.0".to_string();
     let mut port: u16 = 8080;
     let mut index_dir = PathBuf::from("./indices");
-    let mut model_path: Option<PathBuf> = None;
-    let mut _use_cuda = false;
-    let mut _use_int8 = false;
-    let mut _parallel_sessions: Option<usize> = None;
-    let mut _batch_size: Option<usize> = None;
-    let mut _threads: Option<usize> = None;
-    let mut _query_length: Option<usize> = None;
-    let mut _document_length: Option<usize> = None;
-    let mut _model_pool_size: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--host" | "-h" => {
-                if i + 1 < args.len() {
-                    host = args[i + 1].clone();
-                    i += 2;
-                } else {
+                host = args.get(i + 1).cloned().unwrap_or_else(|| {
                     eprintln!("Error: --host requires a value");
                     std::process::exit(1);
-                }
+                });
+                i += 2;
             }
             "--port" | "-p" => {
-                if i + 1 < args.len() {
-                    port = args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid port number");
-                        std::process::exit(1);
-                    });
-                    i += 2;
-                } else {
-                    eprintln!("Error: --port requires a value");
+                port = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("Error: --port requires a valid port number");
                     std::process::exit(1);
-                }
+                });
+                i += 2;
             }
             "--index-dir" | "-d" => {
-                if i + 1 < args.len() {
-                    index_dir = PathBuf::from(&args[i + 1]);
-                    i += 2;
-                } else {
+                index_dir = PathBuf::from(args.get(i + 1).unwrap_or_else(|| {
                     eprintln!("Error: --index-dir requires a value");
                     std::process::exit(1);
-                }
-            }
-            "--model" | "-m" => {
-                if i + 1 < args.len() {
-                    model_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --model requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--cuda" => {
-                _use_cuda = true;
-                i += 1;
-            }
-            "--int8" => {
-                _use_int8 = true;
-                i += 1;
-            }
-            "--parallel" => {
-                if i + 1 < args.len() {
-                    _parallel_sessions = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid number of parallel sessions");
-                        std::process::exit(1);
-                    }));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --parallel requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--batch-size" => {
-                if i + 1 < args.len() {
-                    _batch_size = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid batch size");
-                        std::process::exit(1);
-                    }));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --batch-size requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--threads" => {
-                if i + 1 < args.len() {
-                    _threads = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid number of threads");
-                        std::process::exit(1);
-                    }));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --threads requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--query-length" => {
-                if i + 1 < args.len() {
-                    _query_length = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid query length");
-                        std::process::exit(1);
-                    }));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --query-length requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--document-length" => {
-                if i + 1 < args.len() {
-                    _document_length = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid document length");
-                        std::process::exit(1);
-                    }));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --document-length requires a value");
-                    std::process::exit(1);
-                }
-            }
-            "--model-pool-size" => {
-                if i + 1 < args.len() {
-                    _model_pool_size = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                        eprintln!("Error: Invalid model pool size");
-                        std::process::exit(1);
-                    }));
-                    i += 2;
-                } else {
-                    eprintln!("Error: --model-pool-size requires a value");
-                    std::process::exit(1);
-                }
+                }));
+                i += 2;
             }
             "--help" => {
                 println!(
@@ -658,44 +387,22 @@ async fn main() {
 Usage: next-plaid-api [OPTIONS]
 
 Options:
-  -h, --host <HOST>        Host to bind to (default: 0.0.0.0)
-  -p, --port <PORT>        Port to bind to (default: 8080)
-  -d, --index-dir <DIR>    Directory for storing indices (default: ./indices)
-  -m, --model <PATH>       Path to ONNX model directory for encoding (optional)
-  --cuda                   Use CUDA for model inference (requires --model)
-  --int8                   Use INT8 quantized model for faster inference (requires --model)
-  --parallel <N>           Number of parallel ONNX sessions (default: 1)
-                           More sessions = more parallelism but also more memory.
-                           Recommended: 8-25 for high throughput scenarios.
-  --batch-size <N>         Batch size per ONNX session (default: 32 CPU, 64 GPU, 2 parallel)
-                           Smaller batches are better for parallel sessions.
-  --threads <N>            Threads per ONNX session (default: auto-detected)
-                           Auto-set to 1 when using --parallel.
-  --query-length <N>       Maximum query length in tokens (default: 48)
-                           Overrides value from model config file.
-  --document-length <N>    Maximum document length in tokens (default: 300)
-                           Overrides value from model config file.
-  --model-pool-size <N>    Number of model worker instances for concurrent encoding
-                           (default: 1). Each worker owns a separate model instance.
-                           More workers = more encoding parallelism but also more memory.
-  --help                   Show this help message
+  -h, --host <HOST>      Host to bind to (default: 0.0.0.0)
+  -p, --port <PORT>      Port to bind to (default: 8080)
+  -d, --index-dir <DIR>  Directory for storing indices (default: ./indices)
+  --help                 Show this help message
 
 Environment Variables:
-  RUST_LOG                 Set log level (e.g., RUST_LOG=debug)
-
-Swagger UI:
-  http://<host>:<port>/swagger-ui
+  RUST_LOG               Log level (e.g., RUST_LOG=debug)
+  RATE_LIMIT_ENABLED     Enable rate limiting (true/1/yes)
+  RATE_LIMIT_PER_SECOND  Requests per second when rate limiting enabled (default: 50)
+  RATE_LIMIT_BURST_SIZE  Burst size when rate limiting enabled (default: 100)
+  CONCURRENCY_LIMIT      Max concurrent in-flight requests (default: 100)
 
 Examples:
-  next-plaid-api                                          # Start on port 8080
-  next-plaid-api -p 3000 -d /data/indices                 # Custom port and directory
-  next-plaid-api --model ./models/colbert                 # Enable text encoding
-  next-plaid-api --model ./models/colbert --cuda          # Enable encoding with CUDA
-  next-plaid-api --model ./models/colbert --int8          # Enable encoding with INT8 quantization
-  next-plaid-api --model ./models/colbert --parallel 16   # 16 parallel sessions for high throughput
-  next-plaid-api --model ./models/colbert --parallel 8 --batch-size 4  # Fine-tuned parallel config
-  next-plaid-api --model ./models/colbert --model-pool-size 2  # 2 model workers for concurrent encoding
-  RUST_LOG=debug next-plaid-api                           # Debug logging
+  next-plaid-api
+  next-plaid-api -p 3000 -d /data/indices
+  RUST_LOG=debug next-plaid-api
 "#
                 );
                 std::process::exit(0);
@@ -708,187 +415,20 @@ Examples:
         }
     }
 
-    // Create config
     let config = ApiConfig {
         index_dir,
         default_top_k: 10,
     };
 
-    tracing::info!(
-        index_dir = %config.index_dir.display(),
-        "server.starting"
-    );
+    tracing::info!(index_dir = %config.index_dir.display(), "server.starting");
 
-    // Load model if specified
-    #[cfg(feature = "model")]
-    let model = if let Some(ref model_path) = model_path {
-        let execution_provider = if _use_cuda {
-            next_plaid_onnx::ExecutionProvider::Cuda
-        } else {
-            next_plaid_onnx::ExecutionProvider::Cpu
-        };
-
-        let mut builder = next_plaid_onnx::Colbert::builder(model_path)
-            .with_execution_provider(execution_provider)
-            .with_quantized(_use_int8);
-
-        // Apply optional model configuration
-        if let Some(parallel) = _parallel_sessions {
-            builder = builder.with_parallel(parallel);
-        }
-        if let Some(batch_size) = _batch_size {
-            builder = builder.with_batch_size(batch_size);
-        }
-        if let Some(threads) = _threads {
-            builder = builder.with_threads(threads);
-        }
-        if let Some(query_length) = _query_length {
-            builder = builder.with_query_length(query_length);
-        }
-        if let Some(document_length) = _document_length {
-            builder = builder.with_document_length(document_length);
-        }
-
-        match builder.build() {
-            Ok(model) => {
-                let cfg = model.config();
-                tracing::info!(
-                    model_path = %model_path.display(),
-                    model_name = ?cfg.model_name(),
-                    execution_provider = if _use_cuda { "cuda" } else { "cpu" },
-                    quantized = _use_int8,
-                    embedding_dim = model.embedding_dim(),
-                    batch_size = model.batch_size(),
-                    num_sessions = model.num_sessions(),
-                    query_length = cfg.query_length,
-                    document_length = cfg.document_length,
-                    query_expansion = cfg.do_query_expansion,
-                    "model.load.complete"
-                );
-                Some(model)
-            }
-            Err(e) => {
-                tracing::error!(
-                    model_path = %model_path.display(),
-                    error = %e,
-                    "model.load.failed"
-                );
-                eprintln!("Error: Failed to load model from {:?}: {}", model_path, e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        tracing::debug!("model.disabled");
-        None
-    };
-
-    // Create state
-    #[cfg(feature = "model")]
-    let state = {
-        let model_info = model_path.as_ref().map(|path| state::ModelInfo {
-            path: path.to_string_lossy().to_string(),
-            quantized: _use_int8,
-        });
-
-        // Create model pool if model was loaded successfully
-        let model_pool = model.map(|m| {
-            let model_cfg = m.config();
-            let pool_size = _model_pool_size.unwrap_or(1);
-
-            // Create cached model info for lock-free health endpoint access
-            let cached_info = state::CachedModelInfo {
-                name: model_cfg.model_name().map(|s| s.to_string()),
-                path: model_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                quantized: _use_int8,
-                embedding_dim: m.embedding_dim(),
-                batch_size: m.batch_size(),
-                num_sessions: m.num_sessions(),
-                query_prefix: model_cfg.query_prefix.clone(),
-                document_prefix: model_cfg.document_prefix.clone(),
-                query_length: model_cfg.query_length,
-                document_length: model_cfg.document_length,
-                do_query_expansion: model_cfg.do_query_expansion,
-                uses_token_type_ids: model_cfg.uses_token_type_ids,
-                mask_token_id: model_cfg.mask_token_id,
-                pad_token_id: model_cfg.pad_token_id,
-            };
-
-            // Create model config for workers to build their own instances
-            let model_config = state::ModelConfig {
-                path: model_path.clone().unwrap(),
-                use_cuda: _use_cuda,
-                use_int8: _use_int8,
-                parallel_sessions: _parallel_sessions,
-                batch_size: _batch_size,
-                threads: _threads,
-                query_length: _query_length,
-                document_length: _document_length,
-            };
-
-            // Drop the initial model - workers will create their own
-            drop(m);
-
-            state::ModelPool {
-                pool_size,
-                model_config,
-                cached_info,
-            }
-        });
-
-        Arc::new(AppState::with_model_pool(config, model_pool, model_info))
-    };
-
-    #[cfg(not(feature = "model"))]
-    let state = {
-        if model_path.is_some() {
-            tracing::warn!("Model path specified but 'model' feature is not enabled. Encoding will be disabled.");
-        }
-        Arc::new(AppState::new(config))
-    };
-
-    // Build router
+    let state = Arc::new(AppState::new(config));
     let app = build_router(state);
 
-    // Start server
     let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
-    // Read rate limit configuration for logging
-    let rate_limit_per_second: u64 = std::env::var("RATE_LIMIT_PER_SECOND")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
-    let rate_limit_burst_size: u32 = std::env::var("RATE_LIMIT_BURST_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
-    let concurrency_limit: usize = std::env::var("CONCURRENCY_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
-    let max_queued_tasks: usize = std::env::var("MAX_QUEUED_TASKS_PER_INDEX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
-    let max_batch_documents: usize = std::env::var("MAX_BATCH_DOCUMENTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
-    let max_batch_texts: usize = std::env::var("MAX_BATCH_TEXTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
-
     tracing::info!(
         listen_addr = %addr,
         swagger_ui = %format!("http://{}/swagger-ui", addr),
-        rate_limit_per_second = rate_limit_per_second,
-        rate_limit_burst = rate_limit_burst_size,
-        concurrency_limit = concurrency_limit,
-        max_queued_tasks = max_queued_tasks,
-        max_batch_documents = max_batch_documents,
-        max_batch_texts = max_batch_texts,
         "server.started"
     );
 

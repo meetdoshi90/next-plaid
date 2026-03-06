@@ -1,9 +1,0 @@
-{
-  "name": "colgrep",
-  "description": "Search code and text files efficiently using semantic and lexical search.",
-  "version": "1.0.8",
-  "author": {
-    "name": "Raphael Sourty"
-  },
-  "hooks": "./hooks/hook.json"
-}
