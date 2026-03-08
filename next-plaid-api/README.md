@@ -1,7 +1,7 @@
 <div align="center">
   <h1>NextPlaid API</h1>
-  <p>A REST API for multi-vector search with built-in text encoding.<br/>
-  Async batching, metadata filtering, optional rate limiting, Swagger UI. Powers the <a href="../">NextPlaid</a> ecosystem.</p>
+  <p>A REST API for multi-vector search.<br/>
+  Async batching, metadata filtering, optional rate limiting, Swagger UI.</p>
 
   <p>
     <a href="#quick-start"><b>Quick Start</b></a>
@@ -23,17 +23,9 @@
 **Run with Docker (recommended):**
 
 ```bash
-# CPU with built-in model
 docker run -p 8080:8080 -v ~/.local/share/next-plaid:/data/indices \
   ghcr.io/lightonai/next-plaid:cpu-1.0.6 \
-  --host 0.0.0.0 --port 8080 --index-dir /data/indices \
-  --model lightonai/answerai-colbert-small-v1-onnx --int8
-
-# GPU with CUDA
-docker run --gpus all -p 8080:8080 -v ~/.local/share/next-plaid:/data/indices \
-  ghcr.io/lightonai/next-plaid:cuda-1.0.6 \
-  --host 0.0.0.0 --port 8080 --index-dir /data/indices \
-  --model lightonai/GTE-ModernColBERT-v1 --cuda
+  --host 0.0.0.0 --port 8080 --index-dir /data/indices
 ```
 
 **Use from Python:**
@@ -47,18 +39,18 @@ from next_plaid_client import NextPlaidClient, IndexConfig
 
 client = NextPlaidClient("http://localhost:8080")
 
-# Create index and add documents
+# Create index and add documents (you provide embeddings)
 client.create_index("docs", IndexConfig(nbits=4))
 client.add("docs",
-    documents=["NextPlaid is a multi-vector database", "ColGREP searches code semantically"],
+    documents=[embeddings_1, embeddings_2],
     metadata=[{"id": "doc_1"}, {"id": "doc_2"}],
 )
 
 # Search
-results = client.search("docs", ["vector database"])
+results = client.search("docs", [query_embedding])
 
 # Search with metadata filtering
-results = client.search("docs", ["coding tool"],
+results = client.search("docs", [query_embedding],
     filter_condition="id = ?", filter_parameters=["doc_1"],
 )
 
@@ -74,30 +66,18 @@ curl -X POST http://localhost:8080/indices \
   -H 'Content-Type: application/json' \
   -d '{"name": "docs", "config": {"nbits": 4}}'
 
-# Add documents (text encoded server-side)
-curl -X POST http://localhost:8080/indices/docs/update_with_encoding \
+# Add documents with pre-computed embeddings
+curl -X POST http://localhost:8080/indices/docs/update \
   -H 'Content-Type: application/json' \
-  -d '{"documents": ["hello world"], "metadata": [{"title": "test"}]}'
+  -d '{"documents": [{"embeddings": [[0.1, 0.2, 0.3]]}], "metadata": [{"title": "test"}]}'
 
 # Search
-curl -X POST http://localhost:8080/indices/docs/search_with_encoding \
+curl -X POST http://localhost:8080/indices/docs/search \
   -H 'Content-Type: application/json' \
-  -d '{"queries": ["hello"], "params": {"top_k": 5}}'
+  -d '{"queries": [{"embeddings": [[0.1, 0.2, 0.3]]}], "params": {"top_k": 5}}'
 ```
 
 Interactive docs at [http://localhost:8080/swagger-ui](http://localhost:8080/swagger-ui).
-
----
-
-## Two Modes
-
-NextPlaid API runs in two modes depending on whether you pass `--model`:
-
-|               | **With `--model`**                                       | **Without `--model`**                               |
-| ------------- | -------------------------------------------------------- | --------------------------------------------------- |
-| **Encoding**  | Pass text, get results. Server encodes via ONNX Runtime. | You encode externally, pass embedding arrays.       |
-| **Endpoints** | All endpoints available, including `*_with_encoding`     | Core endpoints only. Encoding endpoints return 400. |
-| **Use case**  | Production deployments, Python SDK                       | Custom models, external encoding pipelines          |
 
 ---
 
@@ -105,12 +85,12 @@ NextPlaid API runs in two modes depending on whether you pass `--model`:
 
 ### Health & Documentation
 
-| Method | Path                     | Description                                                      |
-| ------ | ------------------------ | ---------------------------------------------------------------- |
-| `GET`  | `/health`                | Health check with system info, model config, all index summaries |
-| `GET`  | `/`                      | Alias for `/health`                                              |
-| `GET`  | `/swagger-ui`            | Interactive Swagger UI                                           |
-| `GET`  | `/api-docs/openapi.json` | OpenAPI 3.0 specification                                        |
+| Method | Path                     | Description                                           |
+| ------ | ------------------------ | ----------------------------------------------------- |
+| `GET`  | `/health`                | Health check with system info and all index summaries |
+| `GET`  | `/`                      | Alias for `/health`                                   |
+| `GET`  | `/swagger-ui`            | Interactive Swagger UI                                |
+| `GET`  | `/api-docs/openapi.json` | OpenAPI 3.0 specification                             |
 
 ### Index Management
 
@@ -124,23 +104,20 @@ NextPlaid API runs in two modes depending on whether you pass `--model`:
 
 ### Documents
 
-| Method   | Path                                   | Returns | Description                                |
-| -------- | -------------------------------------- | ------- | ------------------------------------------ |
-| `POST`   | `/indices/{name}/update`               | `202`   | Add documents with pre-computed embeddings |
-| `POST`   | `/indices/{name}/update_with_encoding` | `202`   | Add documents as text (server encodes)     |
-| `POST`   | `/indices/{name}/documents`            | `202`   | Add to existing index (legacy)             |
-| `DELETE` | `/indices/{name}/documents`            | `202`   | Delete by SQL WHERE condition              |
+| Method   | Path                        | Returns     | Description                                                                            |
+| -------- | --------------------------- | ----------- | -------------------------------------------------------------------------------------- |
+| `POST`   | `/indices/{name}/update`    | `202`/`200` | Add documents with pre-computed embeddings. Pass `?wait=true` to block until indexed.  |
+| `POST`   | `/indices/{name}/documents` | `202`       | Add to existing index (legacy)                                                         |
+| `DELETE` | `/indices/{name}/documents` | `202`       | Delete by SQL WHERE condition                                                          |
 
-All document mutations return `202 Accepted` and process asynchronously. Concurrent requests to the same index are batched automatically.
+All document mutations return `202 Accepted` and process asynchronously. Concurrent requests to the same index are batched automatically. Use `?wait=true` on `/update` when you need synchronous confirmation that documents are indexed and searchable.
 
 ### Search
 
-| Method | Path                                            | Description                   |
-| ------ | ----------------------------------------------- | ----------------------------- |
-| `POST` | `/indices/{name}/search`                        | Search with embedding arrays  |
-| `POST` | `/indices/{name}/search/filtered`               | Search + SQL metadata filter  |
-| `POST` | `/indices/{name}/search_with_encoding`          | Search with text queries      |
-| `POST` | `/indices/{name}/search/filtered_with_encoding` | Text search + metadata filter |
+| Method | Path                              | Description                  |
+| ------ | --------------------------------- | ---------------------------- |
+| `POST` | `/indices/{name}/search`          | Search with embedding arrays |
+| `POST` | `/indices/{name}/search/filtered` | Search + SQL metadata filter |
 
 ### Metadata
 
@@ -152,14 +129,6 @@ All document mutations return `202 Accepted` and process asynchronously. Concurr
 | `POST` | `/indices/{name}/metadata/query`  | Get doc IDs matching SQL condition      |
 | `POST` | `/indices/{name}/metadata/get`    | Get metadata by IDs or SQL condition    |
 | `POST` | `/indices/{name}/metadata/update` | Update metadata rows matching condition |
-
-### Encoding & Reranking
-
-| Method | Path                    | Description                                  |
-| ------ | ----------------------- | -------------------------------------------- |
-| `POST` | `/encode`               | Encode texts to ColBERT embeddings           |
-| `POST` | `/rerank`               | Rerank with pre-computed embeddings (MaxSim) |
-| `POST` | `/rerank_with_encoding` | Rerank with text (server encodes + MaxSim)   |
 
 ---
 
@@ -192,29 +161,11 @@ POST /indices
 | `start_from_scratch` | `999`   | Below this doc count, full rebuild on update  |
 | `max_documents`      | `null`  | Evict oldest when exceeded (null = unlimited) |
 
-### Add Documents (text)
-
-```bash
-POST /indices/my_index/update_with_encoding
-```
-
-```json
-{
-  "documents": [
-    "Paris is the capital of France.",
-    "Berlin is the capital of Germany."
-  ],
-  "metadata": [{ "country": "France" }, { "country": "Germany" }],
-  "pool_factor": 2
-}
-```
-
-Returns `202 Accepted`. The `pool_factor` reduces token count via hierarchical clustering (e.g. 2 = ~50% fewer embeddings per document).
-
-### Add Documents (embeddings)
+### Add Documents
 
 ```bash
 POST /indices/my_index/update
+POST /indices/my_index/update?wait=true   # block until searchable
 ```
 
 ```json
@@ -237,15 +188,15 @@ POST /indices/my_index/update
 }
 ```
 
-### Search (text)
+### Search
 
 ```bash
-POST /indices/my_index/search_with_encoding
+POST /indices/my_index/search
 ```
 
 ```json
 {
-  "queries": ["What is the capital of France?"],
+  "queries": [{"embeddings": [[0.1, 0.2, 0.3]]}],
   "params": { "top_k": 10 }
 }
 ```
@@ -259,7 +210,7 @@ POST /indices/my_index/search_with_encoding
       "query_id": 0,
       "document_ids": [0, 1],
       "scores": [18.42, 12.67],
-      "metadata": [{ "country": "France" }, { "country": "Germany" }]
+      "metadata": [{ "title": "Doc A" }, { "title": "Doc B" }]
     }
   ],
   "num_queries": 1
@@ -269,12 +220,12 @@ POST /indices/my_index/search_with_encoding
 ### Search with Filter
 
 ```bash
-POST /indices/my_index/search/filtered_with_encoding
+POST /indices/my_index/search/filtered
 ```
 
 ```json
 {
-  "queries": ["capital city"],
+  "queries": [{"embeddings": [[0.1, 0.2, 0.3]]}],
   "params": { "top_k": 5 },
   "filter_condition": "country = ?",
   "filter_parameters": ["France"]
@@ -305,60 +256,6 @@ DELETE /indices/my_index/documents
 
 Returns `202 Accepted`. Deletes are batched: multiple delete requests within a short window are processed together.
 
-### Encode
-
-```bash
-POST /encode
-```
-
-```json
-{
-  "texts": ["Paris is the capital of France."],
-  "input_type": "document",
-  "pool_factor": 2
-}
-```
-
-**Response:**
-
-```json
-{
-  "embeddings": [[[0.1, 0.2, ...], [0.3, 0.4, ...]]],
-  "num_texts": 1
-}
-```
-
-`input_type` is `"query"` or `"document"`. Queries use MASK token expansion. Documents filter padding tokens.
-
-### Rerank
-
-```bash
-POST /rerank_with_encoding
-```
-
-```json
-{
-  "query": "What is the capital of France?",
-  "documents": [
-    "Paris is the capital of France.",
-    "Berlin is the capital of Germany."
-  ],
-  "pool_factor": null
-}
-```
-
-**Response:**
-
-```json
-{
-  "results": [
-    { "index": 0, "score": 15.23 },
-    { "index": 1, "score": 8.12 }
-  ],
-  "num_documents": 2
-}
-```
-
 ### Health
 
 ```bash
@@ -383,20 +280,7 @@ GET /health
       "avg_doclen": 50.0,
       "has_metadata": true
     }
-  ],
-  "model": {
-    "name": "GTE-ModernColBERT-v1",
-    "path": "/models/GTE-ModernColBERT-v1",
-    "quantized": false,
-    "embedding_dim": 128,
-    "batch_size": 128,
-    "num_sessions": 1,
-    "query_prefix": "[Q] ",
-    "document_prefix": "[D] ",
-    "query_length": 48,
-    "document_length": 300,
-    "do_query_expansion": true
-  }
+  ]
 }
 ```
 
@@ -422,8 +306,6 @@ All errors return JSON:
 | `BAD_REQUEST`          | 400  | Invalid parameters                                                |
 | `DIMENSION_MISMATCH`   | 400  | Embedding dim doesn't match index                                 |
 | `METADATA_NOT_FOUND`   | 404  | No metadata database for this index                               |
-| `MODEL_NOT_LOADED`     | 400  | Encoding endpoint needs `--model`                                 |
-| `MODEL_ERROR`          | 500  | ONNX inference failed                                             |
 | `SERVICE_UNAVAILABLE`  | 503  | Queue full, retry later                                           |
 | `RATE_LIMITED`         | 429  | Too many requests, requires `RATE_LIMIT_ENABLED` (retry after 2s) |
 | `INTERNAL_ERROR`       | 500  | Unexpected server error                                           |
@@ -447,41 +329,33 @@ client = NextPlaidClient("http://localhost:8080")
 
 # Async
 client = AsyncNextPlaidClient("http://localhost:8080")
-await client.search("docs", ["query"])
+await client.search("docs", [query_embedding])
 ```
 
 ### SDK Methods
 
-| Method                                                                      | Description                        |
-| --------------------------------------------------------------------------- | ---------------------------------- |
-| `client.health()`                                                           | Health check                       |
-| `client.create_index(name, config)`                                         | Create index                       |
-| `client.delete_index(name)`                                                 | Delete index                       |
-| `client.get_index(name)`                                                    | Get index info                     |
-| `client.list_indices()`                                                     | List all indices                   |
-| `client.add(name, documents, metadata)`                                     | Add documents (text or embeddings) |
-| `client.search(name, queries, params, filter_condition, filter_parameters)` | Search                             |
-| `client.delete(name, condition, parameters)`                                | Delete by filter                   |
-| `client.encode(texts, input_type, pool_factor)`                             | Encode texts                       |
-| `client.rerank(query, documents)`                                           | Rerank documents                   |
+| Method                                                                      | Description      |
+| --------------------------------------------------------------------------- | ---------------- |
+| `client.health()`                                                           | Health check     |
+| `client.create_index(name, config)`                                         | Create index     |
+| `client.delete_index(name)`                                                 | Delete index     |
+| `client.get_index(name)`                                                    | Get index info   |
+| `client.list_indices()`                                                     | List all indices |
+| `client.add(name, documents, metadata)`                                     | Add documents    |
+| `client.search(name, queries, params, filter_condition, filter_parameters)` | Search           |
+| `client.delete(name, condition, parameters)`                                | Delete by filter |
 
 ---
 
 ## Docker
 
-### Images
+### Image
 
 ```bash
-# CPU (amd64 + arm64)
 docker pull ghcr.io/lightonai/next-plaid:cpu-1.0.6
-
-# CUDA (amd64, requires NVIDIA GPU)
-docker pull ghcr.io/lightonai/next-plaid:cuda-1.0.6
 ```
 
-The Docker entrypoint auto-downloads HuggingFace models. Pass `org/model` as `--model` and it handles the rest. Set `HF_TOKEN` for private models.
-
-### Docker Compose (CPU)
+### Docker Compose
 
 ```yaml
 services:
@@ -491,7 +365,6 @@ services:
       - "8080:8080"
     volumes:
       - ${NEXT_PLAID_DATA:-~/.local/share/next-plaid}:/data/indices
-      - ${NEXT_PLAID_MODELS:-~/.cache/huggingface/next-plaid}:/models
     environment:
       - RUST_LOG=info
     command:
@@ -501,78 +374,24 @@ services:
       - "8080"
       - --index-dir
       - /data/indices
-      - --model
-      - lightonai/answerai-colbert-small-v1-onnx
-      - --int8
-      - --parallel
-      - "16"
-      - --batch-size
-      - "4"
     healthcheck:
-      test:
-        ["CMD", "curl", "-f", "--max-time", "5", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "--max-time", "5", "http://localhost:8080/health"]
       interval: 15s
       timeout: 5s
       retries: 2
-      start_period: 120s
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 16G
-```
-
-### Docker Compose (CUDA)
-
-```yaml
-services:
-  next-plaid-api:
-    image: ghcr.io/lightonai/next-plaid:cuda-1.0.6
-    ports:
-      - "8080:8080"
-    volumes:
-      - ${NEXT_PLAID_DATA:-~/.local/share/next-plaid}:/data/indices
-      - ${NEXT_PLAID_MODELS:-~/.cache/huggingface/next-plaid}:/models
-    environment:
-      - RUST_LOG=info
-      - NVIDIA_VISIBLE_DEVICES=all
-    command:
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8080"
-      - --index-dir
-      - /data/indices
-      - --model
-      - lightonai/GTE-ModernColBERT-v1
-      - --cuda
-      - --batch-size
-      - "128"
-    healthcheck:
-      test:
-        ["CMD", "curl", "-f", "--max-time", "5", "http://localhost:8080/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 2
-      start_period: 120s
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 16G
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 ```
 
 ### Volume Mounts
 
-| Host Path                         | Container Path  | Purpose                  |
-| --------------------------------- | --------------- | ------------------------ |
-| `~/.local/share/next-plaid`       | `/data/indices` | Persistent index storage |
-| `~/.cache/huggingface/next-plaid` | `/models`       | HuggingFace model cache  |
+| Host Path                   | Container Path  | Purpose                  |
+| --------------------------- | --------------- | ------------------------ |
+| `~/.local/share/next-plaid` | `/data/indices` | Persistent index storage |
 
 ---
 
@@ -582,33 +401,18 @@ services:
 next-plaid-api [OPTIONS]
 ```
 
-| Flag                | Default     | Description                                               |
-| ------------------- | ----------- | --------------------------------------------------------- |
-| `-h, --host`        | `0.0.0.0`   | Bind address                                              |
-| `-p, --port`        | `8080`      | Bind port                                                 |
-| `-d, --index-dir`   | `./indices` | Index storage directory                                   |
-| `-m, --model`       | _(none)_    | ONNX model path or HuggingFace ID                         |
-| `--cuda`            | off         | CUDA for model inference                                  |
-| `--int8`            | off         | INT8 quantized model (~2x faster on CPU)                  |
-| `--parallel`        | `1`         | Parallel ONNX sessions (recommended: 8-25 for throughput) |
-| `--batch-size`      | auto        | Batch size per session (32 CPU, 64 GPU, 2 parallel)       |
-| `--threads`         | auto        | Threads per ONNX session (auto: 1 when parallel)          |
-| `--query-length`    | `48`        | Max query length in tokens                                |
-| `--document-length` | `300`       | Max document length in tokens                             |
-| `--model-pool-size` | `1`         | Number of model worker instances for concurrent encoding  |
+| Flag              | Default     | Description             |
+| ----------------- | ----------- | ----------------------- |
+| `-h, --host`      | `0.0.0.0`   | Bind address            |
+| `-p, --port`      | `8080`      | Bind port               |
+| `-d, --index-dir` | `./indices` | Index storage directory |
 
 ```bash
-# Embeddings-only (no model)
-next-plaid-api -p 3000 -d /data/indices
-
-# CPU with model
-next-plaid-api --model lightonai/answerai-colbert-small-v1-onnx --int8 --parallel 16
-
-# GPU
-next-plaid-api --model lightonai/GTE-ModernColBERT-v1 --cuda --batch-size 128
+# Run
+next-plaid-api -p 8080 -d /data/indices
 
 # Debug logging
-RUST_LOG=debug next-plaid-api --model ./models/colbert
+RUST_LOG=debug next-plaid-api -d /data/indices
 ```
 
 ---
@@ -621,8 +425,6 @@ flowchart TD
         H["/health"]
         I["/indices/*"]
         S["/search"]
-        E["/encode"]
-        R["/rerank"]
     end
 
     subgraph Middleware
@@ -635,7 +437,6 @@ flowchart TD
     subgraph Workers["Background Workers"]
         UQ["Update Batch Queue<br/>per index"]
         DQ["Delete Batch Queue<br/>per index"]
-        EQ["Encode Batch Queue<br/>global"]
     end
 
     subgraph Core["Core (next-plaid)"]
@@ -643,28 +444,20 @@ flowchart TD
         SQ["SQLite<br/>Metadata Filtering"]
     end
 
-    subgraph Model["Model (next-plaid-onnx)"]
-        OX["ONNX Runtime<br/>ColBERT Encoder"]
-    end
-
     API --> Middleware
     I --> UQ
     I --> DQ
-    E --> EQ
     UQ --> NP
     DQ --> NP
     UQ --> SQ
     DQ --> SQ
     S --> NP
     S --> SQ
-    EQ --> OX
-    R --> OX
 
     style API fill:#4a90d9,stroke:#357abd,color:#fff
     style Middleware fill:#50b86c,stroke:#3d9956,color:#fff
     style Workers fill:#e8913a,stroke:#d07a2e,color:#fff
     style Core fill:#9b59b6,stroke:#8445a0,color:#fff
-    style Model fill:#e74c3c,stroke:#c0392b,color:#fff
 ```
 
 ### Concurrency Design
@@ -672,9 +465,8 @@ flowchart TD
 The API uses **lock-free reads** and **batched writes** for high throughput:
 
 - **Reads (search, metadata queries):** Lock-free via `ArcSwap`. Readers never block, even during writes.
-- **Index updates:** Per-index batch queue collects requests, processes up to 300 documents (or 100ms timeout) in a single atomic operation.
+- **Index updates:** Per-index batch queue collects requests, processes up to 300 documents (or 100ms timeout) in a single atomic operation. Pass `?wait=true` to block until the batch is fully indexed and searchable.
 - **Deletes:** Per-index delete queue batches conditions, resolves IDs inside the lock to handle ID shifting correctly.
-- **Encoding:** Global worker pool with `N` model instances. Requests are grouped by `input_type` and `pool_factor`, then encoded in a single batch.
 - **Auto-repair:** Before every update/delete, the API checks if the vector index and SQLite metadata are in sync. If not, it repairs automatically.
 
 ```mermaid
@@ -698,7 +490,7 @@ flowchart LR
 
 ### Rate Limiting
 
-Rate limiting is **optional and disabled by default**. Enable it by setting `RATE_LIMIT_ENABLED=true`. When enabled, the API applies a token bucket algorithm to a subset of routes:
+Rate limiting is **optional and disabled by default**. Enable it by setting `RATE_LIMIT_ENABLED=true`.
 
 | Scope                                                        | Rate limited? | Why exempt                           |
 | ------------------------------------------------------------ | ------------- | ------------------------------------ |
@@ -706,7 +498,6 @@ Rate limiting is **optional and disabled by default**. Enable it by setting `RAT
 | `GET /indices`, `GET /indices/{name}`                        | No            | Clients poll during async operations |
 | `POST /indices/{name}/update*`                               | No            | Has per-index semaphore protection   |
 | `DELETE /indices/{name}`, `DELETE /indices/{name}/documents` | No            | Has internal batching                |
-| `/encode`, `/rerank*`                                        | No            | Has internal backpressure via queue  |
 | Everything else                                              | Yes           | Standard rate limiting               |
 
 ---
@@ -730,13 +521,6 @@ Rate limiting is **optional and disabled by default**. Enable it by setting `RAT
 | `MAX_BATCH_DOCUMENTS`        | `300`   | Documents per batch before processing         |
 | `BATCH_CHANNEL_SIZE`         | `100`   | Buffer for document batch queue               |
 
-### Encode Batching
-
-| Variable                    | Default | Description                   |
-| --------------------------- | ------- | ----------------------------- |
-| `MAX_BATCH_TEXTS`           | `64`    | Texts per encoding batch      |
-| `ENCODE_BATCH_CHANNEL_SIZE` | `256`   | Buffer for encode batch queue |
-
 ### Delete Batching
 
 | Variable                      | Default | Description                                        |
@@ -747,51 +531,43 @@ Rate limiting is **optional and disabled by default**. Enable it by setting `RAT
 
 ### Logging
 
-| Variable   | Default  | Description                                   |
-| ---------- | -------- | --------------------------------------------- |
-| `RUST_LOG` | `info`   | Log level (`debug`, `info`, `warn`, `error`)  |
-| `HF_TOKEN` | _(none)_ | HuggingFace token for private model downloads |
+| Variable   | Default | Description                                  |
+| ---------- | ------- | -------------------------------------------- |
+| `RUST_LOG` | `info`  | Log level (`debug`, `info`, `warn`, `error`) |
 
 ---
 
 ## Feature Flags
 
-| Feature      | Description                                        |
-| ------------ | -------------------------------------------------- |
-| _(default)_  | Core API, no BLAS, no model support                |
-| `openblas`   | OpenBLAS for matrix operations (Linux)             |
-| `accelerate` | Apple Accelerate (macOS)                           |
-| `model`      | ONNX model encoding (`/encode`, `*_with_encoding`) |
-| `cuda`       | CUDA acceleration (implies `model`)                |
+| Feature      | Description                            |
+| ------------ | -------------------------------------- |
+| _(default)_  | Core API, no BLAS                      |
+| `openblas`   | OpenBLAS for matrix operations (Linux) |
+| `accelerate` | Apple Accelerate (macOS)               |
 
 ```bash
-# Embeddings-only API
+# Default
 cargo build --release -p next-plaid-api
 
-# With model support (CPU, Linux)
-cargo build --release -p next-plaid-api --features "openblas,model"
-
-# With CUDA
-cargo build --release -p next-plaid-api --features "cuda"
+# With OpenBLAS (Linux)
+cargo build --release -p next-plaid-api --features openblas
 ```
 
 ---
 
 ## Modules
 
-| Module               | Lines | Description                                                            |
-| -------------------- | ----: | ---------------------------------------------------------------------- |
-| `handlers/documents` | 1,638 | Index CRUD, update batching, delete batching, eviction, auto-repair    |
-| `models`             |   759 | All request/response JSON schemas with OpenAPI annotations             |
-| `handlers/encode`    |   549 | Encode worker pool, batch grouping by input type, ONNX inference       |
-| `state`              |   488 | `AppState`, `IndexSlot` (ArcSwap), model pool, config caching          |
-| `handlers/search`    |   449 | Search + filtered search, metadata enrichment, text-to-search pipeline |
-| `handlers/metadata`  |   484 | Metadata CRUD: check, query, get, count, update                        |
-| `handlers/rerank`    |   292 | ColBERT MaxSim scoring, text and embedding reranking                   |
-| `error`              |   138 | Error types with HTTP status code mapping                              |
-| `tracing_middleware` |   115 | Request tracing via `X-Request-ID` header                              |
-| `main`               |   887 | CLI argument parsing, router construction, Swagger UI, server startup  |
-| `lib`                |    44 | `PrettyJson` response type, module re-exports                          |
+| Module               | Description                                                         |
+| -------------------- | ------------------------------------------------------------------- |
+| `handlers/documents` | Index CRUD, update batching, delete batching, eviction, auto-repair |
+| `models`             | All request/response JSON schemas with OpenAPI annotations          |
+| `state`              | `AppState`, `IndexSlot` (ArcSwap), config caching                   |
+| `handlers/search`    | Search + filtered search, metadata enrichment                       |
+| `handlers/metadata`  | Metadata CRUD: check, query, get, count, update                     |
+| `error`              | Error types with HTTP status code mapping                           |
+| `tracing_middleware` | Request tracing via `X-Request-ID` header                           |
+| `main`               | CLI argument parsing, router construction, Swagger UI, startup      |
+| `lib`                | `PrettyJson` response type, module re-exports                       |
 
 ---
 
@@ -800,7 +576,6 @@ cargo build --release -p next-plaid-api --features "cuda"
 | Crate                          | Purpose                                          |
 | ------------------------------ | ------------------------------------------------ |
 | `next-plaid`                   | Core PLAID index (IVF + PQ + MaxSim)             |
-| `next-plaid-onnx`              | ColBERT ONNX encoding (optional)                 |
 | `axum` 0.8                     | Web framework                                    |
 | `tokio`                        | Async runtime                                    |
 | `tower` / `tower-http`         | Middleware (CORS, tracing, timeout, concurrency) |

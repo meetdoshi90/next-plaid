@@ -275,7 +275,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         ))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(ConcurrencyLimitLayer::new(concurrency_limit))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB
         .with_state(state.clone());
 
     // Delete routes — exempt (has internal batching)
@@ -329,7 +329,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 
     let api_router = api_router
         .layer(ConcurrencyLimitLayer::new(concurrency_limit))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB
         .with_state(state);
 
     Router::new()
