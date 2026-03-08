@@ -187,10 +187,16 @@ fn batch_channel_size() -> usize {
     })
 }
 
+#[derive(serde::Deserialize)]
+pub struct UpdateQueryParams {
+    wait: Option<bool>,
+}
+
 /// A single item in the batch queue, representing one update request.
 struct BatchItem {
     embeddings: Vec<Array2<f32>>,
     metadata: Vec<serde_json::Value>,
+    notify: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
 /// Handle to a batch queue for an index.
@@ -307,6 +313,8 @@ async fn batch_worker(
         // Start collecting batch
         let mut batch_embeddings: Vec<Array2<f32>> = first_item.embeddings;
         let mut batch_metadata: Vec<serde_json::Value> = first_item.metadata;
+        let mut notifiers: Vec<tokio::sync::oneshot::Sender<Result<(), String>>> = 
+            first_item.notify.into_iter().collect();
         let mut doc_count = batch_embeddings.len();
         let deadline = Instant::now() + BATCH_TIMEOUT;
 
@@ -322,12 +330,13 @@ async fn batch_worker(
                     let item_docs = item.embeddings.len();
                     batch_embeddings.extend(item.embeddings);
                     batch_metadata.extend(item.metadata);
+                    notifiers.extend(item.notify.into_iter());
                     doc_count += item_docs;
                 }
                 Ok(None) => {
                     // Channel closed - process remaining batch before exiting
                     if !batch_embeddings.is_empty() {
-                        process_batch(&index_name, batch_embeddings, batch_metadata, &state).await;
+                        process_batch(&index_name, batch_embeddings, batch_metadata, notifiers, &state).await;
                     }
                     tracing::debug!(index = %index_name, "update.worker.stopped");
                     return;
@@ -341,7 +350,7 @@ async fn batch_worker(
 
         // Process the collected batch
         if !batch_embeddings.is_empty() {
-            process_batch(&index_name, batch_embeddings, batch_metadata, &state).await;
+            process_batch(&index_name, batch_embeddings, batch_metadata, notifiers, &state).await;
         }
     }
 }
@@ -360,6 +369,7 @@ async fn process_batch(
     index_name: &str,
     embeddings: Vec<Array2<f32>>,
     metadata: Vec<serde_json::Value>,
+    notifiers: Vec<tokio::sync::oneshot::Sender<Result<(), String>>>,
     state: &Arc<AppState>,
 ) {
     let doc_count = embeddings.len();
@@ -396,7 +406,25 @@ async fn process_batch(
             ..Default::default()
         };
         let update_config = UpdateConfig::default();
-
+        
+        // If index exists but is empty/broken (no data to merge), clean up data files
+        let metadata_path = std::path::Path::new(&path_str).join("metadata.json");
+        if metadata_path.exists() {
+            match Metadata::load_from_path(std::path::Path::new(&path_str)) {
+                Ok(meta) if meta.num_documents == 0 => {
+                    // Clean up so update_or_create starts fresh
+                    if let Ok(entries) = std::fs::read_dir(&path_str) {
+                        for entry in entries.flatten() {
+                            if entry.file_name() != "config.json" {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
         // STEP 1: Update vector index FIRST
         let index_update_start = std::time::Instant::now();
         let index_result =
@@ -471,6 +499,11 @@ async fn process_batch(
 
     let total_ms = start.elapsed().as_millis() as u64;
 
+    let outcome: Result<(), String> = match &result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.clone()),
+        Err(e) => Err(e.to_string()),
+    };
     match result {
         Ok(Ok(metrics)) => {
             tracing::info!(
@@ -513,6 +546,9 @@ async fn process_batch(
                 "update.batch.panicked"
             );
         }
+    }
+    for tx in notifiers {
+        let _ = tx.send(outcome.clone());
     }
 }
 
@@ -830,16 +866,27 @@ async fn process_delete_batch(
             }
         }
 
-        // Reload index once after all deletions to get accurate metadata
-        index
-            .reload()
-            .map_err(|e| format!("Failed to reload index after deletions: {}", e))?;
+        // If all documents deleted, index becomes empty and can't be reloaded
         let remaining = index.metadata.num_documents;
-
-        // Reload state
-        state_clone
-            .reload_index(&name_inner)
-            .map_err(|e| format!("Failed to reload index: {}", e))?;
+        if remaining > 0 {
+            index
+                .reload()
+                .map_err(|e| format!("Failed to reload index after deletions: {}", e))?;
+            state_clone
+                .reload_index(&name_inner)
+                .map_err(|e| format!("Failed to reload index: {}", e))?;
+        } else {
+            // Index is now empty — unload from memory so next update starts fresh
+            state_clone.unload_index(&name_inner);
+            // Delete index data files (keep config.json) so update_or_create works cleanly
+            let path = std::path::Path::new(&path_str);
+            for entry in std::fs::read_dir(path).map_err(|e| e.to_string())?.flatten() {
+                let fname = entry.file_name();
+                if fname != "config.json" {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
 
         Ok((total_deleted, remaining))
     })
@@ -1386,90 +1433,74 @@ pub async fn delete_index(
 pub async fn update_index(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<UpdateQueryParams>,
     Json(req): Json<UpdateIndexRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    // Validate name
     if name.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Index name cannot be empty".to_string(),
-        ));
+        return Err(ApiError::BadRequest("Index name cannot be empty".to_string()));
     }
-
-    // Basic Validation (Fail fast)
     let index_path = state.index_path(&name);
     let config_path = index_path.join("config.json");
     if !config_path.exists() {
         return Err(ApiError::IndexNotDeclared(name));
     }
-
-    // Heavy CPU work: convert to ndarray
     let embeddings: Vec<Array2<f32>> = req
         .documents
         .iter()
         .map(to_ndarray)
         .collect::<ApiResult<Vec<_>>>()?;
-
     if embeddings.is_empty() {
-        return Err(ApiError::BadRequest(
-            "At least one document is required".to_string(),
-        ));
+        return Err(ApiError::BadRequest("At least one document is required".to_string()));
     }
-
-    // Validate metadata length (metadata is required)
     if req.metadata.len() != embeddings.len() {
         return Err(ApiError::BadRequest(format!(
             "Metadata length ({}) must match documents length ({})",
-            req.metadata.len(),
-            embeddings.len()
+            req.metadata.len(), embeddings.len()
         )));
     }
-
     let doc_count = embeddings.len();
-
-    // Get or create the batch queue for this index
     let sender = get_or_create_batch_queue(&name, state.clone());
 
-    // Create batch item
+    let wait = params.wait.unwrap_or(false);
+    let (notify_tx, notify_rx) = if wait {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let batch_item = BatchItem {
         embeddings,
         metadata: req.metadata,
+        notify: notify_tx,
     };
 
-    // Send to batch queue (non-blocking if channel has capacity)
-    // Check queue depth for warning
     let queue_capacity = batch_channel_size();
     let queue_available = sender.capacity();
     let queue_depth = queue_capacity - queue_available;
-
-    // Warn when queue is >80% full
     if queue_depth > (queue_capacity * 8 / 10) {
-        tracing::warn!(
-            index = %name,
-            queue_depth = queue_depth,
-            max_capacity = queue_capacity,
-            "update.queue.high"
-        );
+        tracing::warn!(index = %name, queue_depth, max_capacity = queue_capacity, "update.queue.high");
     }
 
     sender.try_send(batch_item).map_err(|e| match e {
         mpsc::error::TrySendError::Full(_) => ApiError::ServiceUnavailable(format!(
-            "Update queue full for index '{}'. Max {} pending items. Retry later.",
-            name,
-            batch_channel_size()
+            "Update queue full for index '{}'. Max {} pending items. Retry later.", name, batch_channel_size()
         )),
         mpsc::error::TrySendError::Closed(_) => {
             ApiError::Internal(format!("Batch worker for index '{}' is not running", name))
         }
     })?;
 
-    tracing::debug!(
-        index = %name,
-        num_documents = doc_count,
-        queue_depth = queue_depth + 1,
-        "update.queued"
-    );
+    tracing::debug!(index = %name, num_documents = doc_count, queue_depth = queue_depth + 1, "update.queued");
 
-    // Immediate Response
+    if let Some(rx) = notify_rx {
+        match rx.await {
+            Ok(Ok(())) => return Ok((StatusCode::OK, Json("Update complete"))),
+            Ok(Err(e)) => return Err(ApiError::Internal(e)),
+            Err(_) => return Err(ApiError::Internal("Batch worker dropped notifier".to_string())),
+        }
+    }
+
     Ok((StatusCode::ACCEPTED, Json("Update queued for batching")))
 }
 
