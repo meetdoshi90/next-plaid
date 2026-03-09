@@ -2,6 +2,10 @@
 
 High-performance multi-vector search built in Rust.
 
+## Credits
+
+This project is a fork of [NextPlaid](https://github.com/lightonai/next-plaid), originally developed by [LightOn](https://www.lighton.ai/). Original work licensed under Apache-2.0.
+
 ## Packages
 
 | Package | Description |
